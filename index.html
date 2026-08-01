@@ -109,9 +109,14 @@
 <section id="view-confirm" class="view">
   <div class="topbar">
     <h2 id="confirm-title">Confirm receipt</h2>
-    <button class="btn-icon" onclick="document.getElementById('view-confirm').classList.remove('active'); document.querySelector('[data-view=ledger]').click();" aria-label="Cancel">✕</button>
+    <div style="display:flex; gap:8px;">
+      <button class="btn-icon" id="btn-quick-save" aria-label="Save entry" style="background:var(--success); border-color:var(--success);">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M5 12.5l4.5 4.5L19 7" stroke="white" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+      <button class="btn-icon" id="btn-cancel-confirm" aria-label="Cancel">✕</button>
+    </div>
   </div>
-  <img id="confirm-photo" src="" alt="Captured receipt" style="width:100%; max-height:180px; object-fit:cover; border-radius:14px; border:1px solid var(--line); display:none;">
+  <img id="confirm-photo" src="" alt="Captured receipt — tap to view fullscreen" style="width:100%; max-height:180px; object-fit:cover; border-radius:14px; border:1px solid var(--line); display:none; cursor:zoom-in;">
   <p class="small-note" style="margin-top:8px;">Auto-filled from the photo — double-check before saving, especially the amount.</p>
 
   <form id="confirm-form">

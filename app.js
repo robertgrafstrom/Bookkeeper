@@ -10,6 +10,7 @@ let stream = null;         // camera MediaStream
 let capturedImage = null;  // dataURL of last capture
 let editingEntryId = null; // set when editing an existing entry
 let dirHandle = null;      // remembered export folder (File System Access API)
+let ocrWorker = null;      // reused across scans so repeat captures are fast
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -18,6 +19,9 @@ function showView(name) {
   $$('.view').forEach((v) => v.classList.remove('active'));
   $(`#view-${name}`).classList.add('active');
   $$('.nav-btn').forEach((b) => b.classList.toggle('active', b.dataset.view === name));
+  const nav = $('.bottom-nav');
+  const fullScreenViews = ['capture', 'confirm'];
+  nav.style.display = fullScreenViews.includes(name) ? 'none' : 'flex';
 }
 
 function uid() {
@@ -66,7 +70,14 @@ function bindEvents() {
   $('#btn-close-capture').addEventListener('click', closeCapture);
   $('#btn-shutter').addEventListener('click', capturePhoto);
   $('#btn-retake').addEventListener('click', retake);
+  $('.camera-wrap').addEventListener('click', (e) => {
+    if (e.target.closest('.camera-top-bar, .camera-controls')) return;
+    onTapToFocus(e);
+  });
   $('#confirm-form').addEventListener('submit', onSaveEntry);
+  $('#btn-quick-save').addEventListener('click', () => $('#confirm-form').requestSubmit());
+  $('#btn-cancel-confirm').addEventListener('click', () => { capturedImage = null; editingEntryId = null; showView('ledger'); });
+  $('#confirm-photo').addEventListener('click', () => $('#confirm-photo').classList.toggle('photo-fullscreen'));
   $('#entry-currency').addEventListener('change', onCurrencyChange);
   $('#entry-foreign-flag-manual').addEventListener('change', (e) => {
     $('#entry-currency').dataset.manualOverride = e.target.checked ? '1' : '';
@@ -177,6 +188,7 @@ function lockApp() {
   sessionKey = null;
   entries = [];
   if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  if (ocrWorker) { ocrWorker.terminate().catch(() => {}); ocrWorker = null; }
   $('#unlock-password').value = '';
   showView('unlock');
 }
@@ -197,6 +209,16 @@ async function onToggleBiometric(e) {
   status.textContent = 'Setting up…';
   try {
     if (!window.PublicKeyCredential) throw new Error('unsupported');
+
+    // Fail fast if this browser can report in advance that it doesn't
+    // support PRF, instead of prompting for a fingerprint twice for nothing.
+    if (PublicKeyCredential.getClientCapabilities) {
+      let caps = null;
+      try { caps = await PublicKeyCredential.getClientCapabilities(); } catch { /* capability check itself unsupported */ }
+      if (caps && caps['extension:prf'] === false) {
+        throw new Error('PRF not supported on this device/browser yet.');
+      }
+    }
 
     const prfSaltBytes = new TextEncoder().encode(FIXED_PRF_SALT_LABEL).slice(0, 32);
     const userId = Crypto.randomBytes(16);
@@ -338,12 +360,59 @@ async function openCapture() {
   $('#btn-shutter').style.display = 'flex';
   $('#btn-retake').style.display = 'none';
   try {
-    stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: {
+        facingMode: 'environment',
+        width: { ideal: 1920 },
+        height: { ideal: 1080 },
+      },
+      audio: false,
+    });
     $('#camera-video').srcObject = stream;
+    await enableContinuousFocus();
   } catch (ex) {
     $('#ocr-status').textContent = 'Camera unavailable — check permissions.';
     $('#ocr-status').classList.add('show');
   }
+}
+
+async function enableContinuousFocus() {
+  try {
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.focusMode && caps.focusMode.includes('continuous')) {
+      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+    }
+  } catch { /* this phone/browser doesn't expose focus control — that's fine */ }
+}
+
+async function onTapToFocus(e) {
+  const wrap = $('.camera-wrap');
+  const rect = wrap.getBoundingClientRect();
+  const x = (e.clientX - rect.left) / rect.width;
+  const y = (e.clientY - rect.top) / rect.height;
+  showFocusRing(e.clientX - rect.left, e.clientY - rect.top);
+
+  if (!stream) return;
+  try {
+    const track = stream.getVideoTracks()[0];
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    if (caps.pointsOfInterest) {
+      const advanced = [{ pointsOfInterest: [{ x, y }] }];
+      if (caps.focusMode && caps.focusMode.includes('single-shot')) advanced[0].focusMode = 'single-shot';
+      await track.applyConstraints({ advanced });
+    }
+  } catch { /* no hardware focus-point support on this device */ }
+}
+
+function showFocusRing(x, y) {
+  const wrap = $('.camera-wrap');
+  const ring = document.createElement('div');
+  ring.className = 'focus-ring';
+  ring.style.left = `${x}px`;
+  ring.style.top = `${y}px`;
+  wrap.appendChild(ring);
+  ring.addEventListener('animationend', () => ring.remove());
 }
 
 function closeCapture() {
@@ -374,18 +443,32 @@ function retake() {
   openCapture();
 }
 
+async function getOcrWorker() {
+  if (ocrWorker) return ocrWorker;
+  ocrWorker = await Tesseract.createWorker(['eng', 'swe'], 1, {
+    logger: (m) => {
+      if (m.status === 'recognizing text') {
+        $('#ocr-status').textContent = `Reading receipt… ${Math.round((m.progress || 0) * 100)}%`;
+      }
+    },
+  });
+  return ocrWorker;
+}
+
 async function runOCR(imageDataUrl) {
   const status = $('#ocr-status');
   status.classList.add('show');
-  status.textContent = 'Reading receipt…';
+  status.textContent = 'Warming up the text reader…';
   try {
-    const result = await Tesseract.recognize(imageDataUrl, 'eng+swe');
-    const text = result.data.text || '';
+    const worker = await getOcrWorker();
+    status.textContent = 'Reading receipt…';
+    const { data } = await worker.recognize(imageDataUrl);
+    const text = data.text || '';
     status.classList.remove('show');
     openConfirm(parseReceiptText(text), imageDataUrl);
   } catch (ex) {
-    status.textContent = 'Could not read text automatically — fill it in below.';
-    setTimeout(() => status.classList.remove('show'), 1800);
+    status.textContent = 'Could not read the photo automatically — fill it in below.';
+    setTimeout(() => status.classList.remove('show'), 2200);
     openConfirm(parseReceiptText(''), imageDataUrl);
   }
 }
