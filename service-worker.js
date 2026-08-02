@@ -1,4 +1,4 @@
-const CACHE = 'bookkeeping-v3';
+const CACHE = 'bookkeeping-v4';
 
 // Local app shell + the OCR library, cached on first install so everything
 // after that works with zero network connection.

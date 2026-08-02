@@ -64,7 +64,9 @@ function bindEvents() {
 
   $$('.nav-btn').forEach((b) => b.addEventListener('click', () => {
     const v = b.dataset.view;
-    if (v === 'capture') openCapture(); else showView(v);
+    if (v === 'capture') openCapture();
+    else if (v === 'settings') openSettings();
+    else showView(v);
   }));
 
   $('#btn-close-capture').addEventListener('click', closeCapture);
@@ -78,10 +80,6 @@ function bindEvents() {
   $('#btn-quick-save').addEventListener('click', () => $('#confirm-form').requestSubmit());
   $('#btn-cancel-confirm').addEventListener('click', () => { capturedImage = null; editingEntryId = null; showView('ledger'); });
   $('#confirm-photo').addEventListener('click', () => $('#confirm-photo').classList.toggle('photo-fullscreen'));
-  $('#entry-currency').addEventListener('change', onCurrencyChange);
-  $('#entry-foreign-flag-manual').addEventListener('change', (e) => {
-    $('#entry-currency').dataset.manualOverride = e.target.checked ? '1' : '';
-  });
   $('#btn-delete-entry').addEventListener('click', onDeleteEntry);
 
   $('#btn-export').addEventListener('click', exportBackup);
@@ -184,6 +182,18 @@ async function afterUnlock() {
   checkBackupReminder();
 }
 
+async function openSettings() {
+  const bio = await DB.get('meta', 'biometric');
+  const known = await DB.get('meta', 'biometricUnsupported');
+  $('#toggle-biometric').checked = !!bio;
+  $('#biometric-status').textContent = bio
+    ? 'Biometric unlock is on.'
+    : (known && known.value)
+      ? "Not supported on this phone/browser — password unlock is equally secure."
+      : 'Experimental — falls back to password if unsupported.';
+  showView('settings');
+}
+
 function lockApp() {
   sessionKey = null;
   entries = [];
@@ -197,6 +207,8 @@ function lockApp() {
 // Biometric enrollment (Settings toggle) — experimental, feature-detected
 // ---------------------------------------------------------------------
 
+class PrfUnsupportedError extends Error {}
+
 async function onToggleBiometric(e) {
   const checked = e.target.checked;
   const status = $('#biometric-status');
@@ -206,9 +218,17 @@ async function onToggleBiometric(e) {
     status.textContent = 'Biometric unlock is off.';
     return;
   }
+
+  const known = await DB.get('meta', 'biometricUnsupported');
+  if (known && known.value) {
+    e.target.checked = false;
+    status.textContent = "Confirmed earlier: this phone/browser doesn't support biometric-bound keys. Password unlock is equally secure — this one just isn't available here.";
+    return;
+  }
+
   status.textContent = 'Setting up…';
   try {
-    if (!window.PublicKeyCredential) throw new Error('unsupported');
+    if (!window.PublicKeyCredential) throw new PrfUnsupportedError('unsupported');
 
     // Fail fast if this browser can report in advance that it doesn't
     // support PRF, instead of prompting for a fingerprint twice for nothing.
@@ -216,7 +236,7 @@ async function onToggleBiometric(e) {
       let caps = null;
       try { caps = await PublicKeyCredential.getClientCapabilities(); } catch { /* capability check itself unsupported */ }
       if (caps && caps['extension:prf'] === false) {
-        throw new Error('PRF not supported on this device/browser yet.');
+        throw new PrfUnsupportedError('PRF not supported on this device/browser yet.');
       }
     }
 
@@ -246,7 +266,7 @@ async function onToggleBiometric(e) {
     });
     const results = assertion.getClientExtensionResults();
     const prfBits = results.prf && results.prf.results && results.prf.results.first;
-    if (!prfBits) throw new Error('This phone/browser does not support biometric-bound keys (PRF).');
+    if (!prfBits) throw new PrfUnsupportedError('This phone/browser does not support biometric-bound keys (PRF).');
 
     const prfKey = await crypto.subtle.importKey('raw', prfBits, { name: 'AES-GCM' }, false, ['encrypt']);
     const rawKeyBits = await crypto.subtle.exportKey('raw', sessionKey);
@@ -263,7 +283,14 @@ async function onToggleBiometric(e) {
     status.textContent = 'Biometric unlock is on.';
   } catch (ex) {
     e.target.checked = false;
-    status.textContent = 'Not available on this phone/browser — password unlock still works fine.';
+    if (ex instanceof PrfUnsupportedError) {
+      await DB.put('meta', { key: 'biometricUnsupported', value: true });
+      status.textContent = "This phone/browser doesn't support biometric-bound keys — confirmed now, won't ask again. Password unlock is equally secure.";
+    } else if (ex && ex.name === 'NotAllowedError') {
+      status.textContent = 'Cancelled.';
+    } else {
+      status.textContent = 'Not available on this phone/browser — password unlock still works fine.';
+    }
   }
 }
 
@@ -505,7 +532,7 @@ function parseReceiptText(text) {
   const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
   const guess = { vendor: '', date: todayISO(), amount: '', currency: 'SEK' };
 
-  if (lines.length) guess.vendor = lines[0].slice(0, 60);
+  guess.vendor = guessVendor(lines);
 
   // Date: look for common formats
   const dateRe = /(\d{4})[-./](\d{1,2})[-./](\d{1,2})|(\d{1,2})[-./](\d{1,2})[-./](\d{2,4})/;
@@ -525,9 +552,10 @@ function parseReceiptText(text) {
     }
   }
 
-  // Amount: prefer a line containing a total keyword, else the largest number found
+  // Amount: prefer a line containing a total keyword, else the largest number found.
+  // Decimals are optional now — not every receipt shows öre/cents.
   const totalKeywords = /(summa|total|att betala|belopp att betala|to pay|amount due)/i;
-  const numRe = /(\d{1,3}(?:[ .]?\d{3})*(?:[.,]\d{2}))/g;
+  const numRe = /(\d{1,3}(?:[ .]?\d{3})*(?:[.,]\d{2})?)/g;
   let bestFromKeyword = null;
   let largest = 0;
   for (const line of lines) {
@@ -540,12 +568,36 @@ function parseReceiptText(text) {
   const chosen = bestFromKeyword !== null ? bestFromKeyword : largest;
   guess.amount = chosen ? chosen.toFixed(2) : '';
 
-  // Currency
-  if (/€|eur\b/i.test(text)) guess.currency = 'EUR';
-  else if (/\$|usd\b/i.test(text)) guess.currency = 'USD';
-  else guess.currency = 'SEK';
+  guess.currency = guessCurrency(text);
 
   return guess;
+}
+
+function guessVendor(lines) {
+  // Skip lines that are mostly noise (too short, or barely any real letters —
+  // common on the first line or two of a scanned receipt).
+  const lettersOnly = (s) => (s.match(/\p{L}/gu) || []).length;
+  for (const line of lines.slice(0, 6)) {
+    const clean = line.trim();
+    if (clean.length < 3) continue;
+    if (lettersOnly(clean) < 3) continue;
+    if (lettersOnly(clean) / clean.length < 0.4) continue; // mostly symbols/digits
+    return clean.slice(0, 60);
+  }
+  return '';
+}
+
+function guessCurrency(text) {
+  const t = text.toLowerCase();
+  // Checked in this order deliberately: OCR frequently misreads "S" as "$",
+  // so a lone $ is not trusted — only an explicit "usd" counts.
+  if (/\bsek\b|\bkr\b|kronor/.test(t)) return 'SEK';
+  if (/\beur\b|€/.test(t)) return 'EUR';
+  if (/\bgbp\b|£/.test(t)) return 'GBP';
+  if (/\bnok\b/.test(t)) return 'NOK';
+  if (/\bdkk\b/.test(t)) return 'DKK';
+  if (/\busd\b/.test(t)) return 'USD';
+  return 'SEK';
 }
 
 // ---------------------------------------------------------------------
@@ -553,7 +605,6 @@ function parseReceiptText(text) {
 // ---------------------------------------------------------------------
 
 function openConfirm(guess, imageDataUrl) {
-  $('#entry-currency').dataset.manualOverride = '';
   $('#confirm-title').textContent = 'Confirm receipt';
   $('#entry-vendor').value = guess.vendor || '';
   $('#entry-date').value = guess.date || todayISO();
@@ -563,7 +614,6 @@ function openConfirm(guess, imageDataUrl) {
   $('#entry-vat').value = '25';
   $('#entry-category').value = 'Other';
   $('#entry-notes').value = '';
-  $('#entry-foreign-flag-manual').checked = guess.currency !== 'SEK';
   $('#confirm-photo').src = imageDataUrl || '';
   $('#confirm-photo').style.display = imageDataUrl ? 'block' : 'none';
   $('#btn-delete-entry').style.display = 'none';
@@ -575,7 +625,6 @@ function openEditEntry(id) {
   if (!en) return;
   editingEntryId = id;
   capturedImage = en.photo || null;
-  $('#entry-currency').dataset.manualOverride = '1';
   $('#confirm-title').textContent = 'Edit entry';
   $('#entry-vendor').value = en.vendor || '';
   $('#entry-date').value = en.date;
@@ -585,31 +634,49 @@ function openEditEntry(id) {
   $('#entry-vat').value = en.vat;
   $('#entry-category').value = en.category;
   $('#entry-notes').value = en.notes || '';
-  $('#entry-foreign-flag-manual').checked = en.foreignFlag;
   $('#confirm-photo').src = en.photo || '';
   $('#confirm-photo').style.display = en.photo ? 'block' : 'none';
   $('#btn-delete-entry').style.display = 'block';
   showView('confirm');
 }
 
-function onCurrencyChange(e) {
-  if (!e.target.dataset.manualOverride) {
-    $('#entry-foreign-flag-manual').checked = e.target.value !== 'SEK';
-  }
+// Best-effort duplicate check — compares against entries already decrypted
+// in memory for this session, so it never touches storage or weakens
+// encryption. A same date + same amount + same currency is a strong signal
+// you scanned the same receipt twice.
+function findPossibleDuplicate(date, amount, currency) {
+  return entries.find((en) =>
+    en.id !== editingEntryId &&
+    en.date === date &&
+    en.currency === currency &&
+    Math.abs(en.amount - amount) < 0.005
+  );
 }
 
 async function onSaveEntry(e) {
   e.preventDefault();
+  const date = $('#entry-date').value || todayISO();
+  const amount = parseFloat($('#entry-amount').value) || 0;
+  const currency = $('#entry-currency').value;
+
+  const dupe = findPossibleDuplicate(date, amount, currency);
+  if (dupe) {
+    const proceed = confirm(
+      `This looks like a duplicate: you already have an entry for ${dupe.date} — ${fmtAmount(dupe.amount)} ${dupe.currency} (${dupe.vendor || 'no vendor set'}).\n\nSave this one anyway?`
+    );
+    if (!proceed) return;
+  }
+
   const entry = {
     vendor: $('#entry-vendor').value.trim(),
-    date: $('#entry-date').value || todayISO(),
-    amount: parseFloat($('#entry-amount').value) || 0,
-    currency: $('#entry-currency').value,
+    date,
+    amount,
+    currency,
     type: $('#entry-type').value,
     vat: $('#entry-vat').value,
     category: $('#entry-category').value,
     notes: $('#entry-notes').value.trim(),
-    foreignFlag: $('#entry-foreign-flag-manual').checked,
+    foreignFlag: currency !== 'SEK',
     photo: capturedImage,
     createdAt: new Date().toISOString(),
   };
