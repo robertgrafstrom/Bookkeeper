@@ -355,35 +355,52 @@ function escapeHtml(s) {
 async function openCapture() {
   editingEntryId = null;
   showView('capture');
-  $('#camera-video').style.display = 'block';
+  const video = $('#camera-video');
+  video.style.display = 'block';
   $('#captured-canvas').style.display = 'none';
   $('#btn-shutter').style.display = 'flex';
   $('#btn-retake').style.display = 'none';
+  showCameraStatus('Starting camera…');
+
   try {
     stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: 'environment',
-        width: { ideal: 1920 },
-        height: { ideal: 1080 },
-      },
+      video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } },
       audio: false,
     });
-    $('#camera-video').srcObject = stream;
-    await enableContinuousFocus();
+    video.srcObject = stream;
+
+    // Wait until the video actually has real frames before trusting it —
+    // capturing too early produced a blank/zero-size photo before.
+    await new Promise((resolve) => {
+      if (video.readyState >= 2 && video.videoWidth > 0) return resolve();
+      const onReady = () => { video.removeEventListener('loadeddata', onReady); resolve(); };
+      video.addEventListener('loadeddata', onReady);
+      setTimeout(resolve, 3000); // don't block forever on odd devices
+    });
+    try { await video.play(); } catch { /* some browsers autoplay already */ }
+
+    hideCameraStatus();
   } catch (ex) {
-    $('#ocr-status').textContent = 'Camera unavailable — check permissions.';
-    $('#ocr-status').classList.add('show');
+    showCameraStatus(cameraErrorMessage(ex));
   }
 }
 
-async function enableContinuousFocus() {
-  try {
-    const track = stream.getVideoTracks()[0];
-    const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.focusMode && caps.focusMode.includes('continuous')) {
-      await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
-    }
-  } catch { /* this phone/browser doesn't expose focus control — that's fine */ }
+function cameraErrorMessage(ex) {
+  const name = ex && ex.name;
+  if (name === 'NotAllowedError') return 'Camera permission was denied. Check your browser\'s site settings and allow Camera.';
+  if (name === 'NotFoundError') return 'No camera was found on this device.';
+  if (name === 'NotReadableError') return 'Another app is already using the camera — close it and try again.';
+  if (name === 'OverconstrainedError') return 'This camera doesn\'t support the requested settings.';
+  return `Camera error: ${(ex && ex.message) || 'unknown problem starting the camera.'}`;
+}
+
+function showCameraStatus(text) {
+  const el = $('#ocr-status');
+  el.textContent = text;
+  el.classList.add('show');
+}
+function hideCameraStatus() {
+  $('#ocr-status').classList.remove('show');
 }
 
 async function onTapToFocus(e) {
@@ -397,12 +414,14 @@ async function onTapToFocus(e) {
   try {
     const track = stream.getVideoTracks()[0];
     const caps = track.getCapabilities ? track.getCapabilities() : {};
-    if (caps.pointsOfInterest) {
-      const advanced = [{ pointsOfInterest: [{ x, y }] }];
-      if (caps.focusMode && caps.focusMode.includes('single-shot')) advanced[0].focusMode = 'single-shot';
-      await track.applyConstraints({ advanced });
+    const advanced = {};
+    if (caps.pointsOfInterest) advanced.pointsOfInterest = [{ x, y }];
+    if (caps.focusMode && caps.focusMode.includes('single-shot')) advanced.focusMode = 'single-shot';
+    else if (caps.focusMode && caps.focusMode.includes('continuous')) advanced.focusMode = 'continuous';
+    if (Object.keys(advanced).length) {
+      await track.applyConstraints({ advanced: [advanced] });
     }
-  } catch { /* no hardware focus-point support on this device */ }
+  } catch { /* no hardware focus-point support on this device — the tap is still visually acknowledged */ }
 }
 
 function showFocusRing(x, y) {
@@ -421,21 +440,30 @@ function closeCapture() {
 }
 
 async function capturePhoto() {
-  const video = $('#camera-video');
-  const canvas = $('#captured-canvas');
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  const ctx = canvas.getContext('2d');
-  ctx.drawImage(video, 0, 0);
-  capturedImage = canvas.toDataURL('image/jpeg', 0.82);
+  try {
+    const video = $('#camera-video');
+    const canvas = $('#captured-canvas');
+    const w = video.videoWidth, h = video.videoHeight;
+    if (!w || !h) {
+      showCameraStatus('Camera isn\'t ready yet — wait a second and try the shutter again.');
+      return;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, w, h);
+    capturedImage = canvas.toDataURL('image/jpeg', 0.85);
 
-  video.style.display = 'none';
-  canvas.style.display = 'block';
-  $('#btn-shutter').style.display = 'none';
-  $('#btn-retake').style.display = 'flex';
-  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+    video.style.display = 'none';
+    canvas.style.display = 'block';
+    $('#btn-shutter').style.display = 'none';
+    $('#btn-retake').style.display = 'flex';
+    if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
 
-  await runOCR(capturedImage);
+    await runOCR(capturedImage);
+  } catch (ex) {
+    showCameraStatus(`Couldn't capture: ${ex && ex.message ? ex.message : ex}`);
+  }
 }
 
 function retake() {
@@ -715,5 +743,17 @@ async function checkBackupReminder() {
 function dismissBackupBanner() {
   $('#backup-banner').classList.remove('show');
 }
+
+window.addEventListener('error', (e) => {
+  if ($('#view-capture').classList.contains('active')) {
+    showCameraStatus(`Unexpected error: ${e.message}`);
+  }
+});
+window.addEventListener('unhandledrejection', (e) => {
+  if ($('#view-capture').classList.contains('active')) {
+    const msg = (e.reason && e.reason.message) ? e.reason.message : String(e.reason);
+    showCameraStatus(`Unexpected error: ${msg}`);
+  }
+});
 
 document.addEventListener('DOMContentLoaded', init);
